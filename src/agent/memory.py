@@ -7,7 +7,7 @@ Provides:
    enabling agents to learn from their own track record.
 2. **Confidence calibration** — adjusts agent confidence based on
    historical accuracy (only after sufficient sample count).
-3. **Strategy performance tracking** — per-strategy win-rate and
+3. **Skill performance tracking** — per-skill win-rate and
    signal accuracy for auto-weighting.
 
 Storage uses the existing SQLAlchemy database layer
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ _ROLLING_WINDOW = 50
 
 @dataclass
 class CalibrationResult:
-    """Confidence calibration data for an agent or strategy."""
+    """Confidence calibration data for an agent or skill."""
     agent_name: str = ""
     total_samples: int = 0
     historical_accuracy: float = 0.5  # 0.0–1.0
@@ -57,6 +57,43 @@ class AnalysisMemoryEntry:
     outcome_5d: Optional[float] = None  # % change after 5 days
     outcome_20d: Optional[float] = None  # % change after 20 days
     was_correct: Optional[bool] = None
+
+
+@dataclass
+class DecisionSignalReview:
+    """Pre-summarized decision-signal review for one stock (read-only).
+
+    Consumed from the service-layer ReviewMemory aggregation; never mixes
+    into the ``AnalysisHistory`` text section.  ``confidence_adjustment`` of
+    ``observe`` means the evidence base is too weak for any confidence shift
+    and the payload is a caution note only.
+    """
+    stock_code: str = ""
+    sample_size: int = 0
+    completed: int = 0
+    hit_rate_pct: Optional[float] = None
+    avg_return_pct: Optional[float] = None
+    common_miss_reasons: List[str] = field(default_factory=list)
+    confidence_adjustment: str = "observe"
+    notes: str = ""
+
+    def to_prompt_line(self) -> str:
+        """Render one compact line for prompt injection."""
+        parts = [
+            f"stock={self.stock_code}",
+            f"completed={self.completed}",
+            f"sample={self.sample_size}",
+        ]
+        if self.confidence_adjustment != "observe" and self.hit_rate_pct is not None:
+            parts.append(f"hit_rate={self.hit_rate_pct}%")
+            if self.avg_return_pct is not None:
+                parts.append(f"avg_return={self.avg_return_pct}%")
+        parts.append(f"adjustment={self.confidence_adjustment}")
+        if self.common_miss_reasons:
+            parts.append("miss_reasons=" + "/".join(self.common_miss_reasons))
+        if self.notes:
+            parts.append(f"note={self.notes}")
+        return ", ".join(parts)
 
 
 class AgentMemory:
@@ -139,6 +176,40 @@ class AgentMemory:
             return []
 
     # -----------------------------------------------------------------
+    # Decision-signal review (read-only feedback loop, Issue #1903)
+    # -----------------------------------------------------------------
+
+    def get_decision_signal_review(self, stock_code: str) -> Optional[DecisionSignalReview]:
+        """Return the pre-summarized decision-signal review for one stock.
+
+        The aggregation lives in the service layer (ReviewMemory contract);
+        this method only maps the payload for agent consumption.  Returns
+        ``None`` when memory is disabled, the stock code is missing, or the
+        review cannot be computed — callers must treat ``None`` as "no review
+        section", preserving pre-existing behaviour.
+        """
+        if not self.enabled or not stock_code:
+            return None
+        try:
+            from src.services.decision_signal_outcome_service import (
+                DecisionSignalOutcomeService,
+            )
+            payload = DecisionSignalOutcomeService().get_stock_review(stock_code)
+            return DecisionSignalReview(
+                stock_code=str(payload.get("stock_code") or stock_code),
+                sample_size=int(payload.get("sample_size") or 0),
+                completed=int(payload.get("completed") or 0),
+                hit_rate_pct=payload.get("hit_rate_pct"),
+                avg_return_pct=payload.get("avg_return_pct"),
+                common_miss_reasons=list(payload.get("common_miss_reasons") or []),
+                confidence_adjustment=str(payload.get("confidence_adjustment") or "observe"),
+                notes=str(payload.get("notes") or ""),
+            )
+        except Exception as exc:
+            logger.debug("[AgentMemory] get_decision_signal_review failed: %s", exc)
+            return None
+
+    # -----------------------------------------------------------------
     # Confidence calibration
     # -----------------------------------------------------------------
 
@@ -146,9 +217,10 @@ class AgentMemory:
         self,
         agent_name: str,
         stock_code: Optional[str] = None,
+        skill_id: Optional[str] = None,
         strategy_id: Optional[str] = None,
     ) -> CalibrationResult:
-        """Compute confidence calibration for an agent or strategy.
+        """Compute confidence calibration for an agent or skill.
 
         When ``AGENT_MEMORY_ENABLED=false`` or insufficient samples,
         returns a neutral calibration (factor = 1.0).
@@ -159,7 +231,8 @@ class AgentMemory:
             return result
 
         try:
-            stats = self._get_accuracy_stats(agent_name, stock_code, strategy_id)
+            resolved_skill_id = skill_id or strategy_id
+            stats = self._get_accuracy_stats(agent_name, stock_code, resolved_skill_id)
             result.total_samples = stats.get("total", 0)
             result.historical_accuracy = stats.get("accuracy", 0.5)
             result.direction_accuracy = stats.get("direction_accuracy", 0.5)
@@ -198,13 +271,13 @@ class AgentMemory:
         return max(0.0, min(1.0, adjusted))
 
     # -----------------------------------------------------------------
-    # Strategy performance
+    # Skill performance
     # -----------------------------------------------------------------
 
-    def get_strategy_performance(self, strategy_id: str) -> Dict[str, Any]:
-        """Get performance metrics for a strategy.
+    def get_skill_performance(self, skill_id: str) -> Dict[str, Any]:
+        """Get performance metrics for a skill.
 
-        Used by :class:`StrategyAggregator` for weight computation.
+        Used by :class:`SkillAggregator` for weight computation.
         """
         if not self.enabled:
             return {"available": False}
@@ -212,7 +285,7 @@ class AgentMemory:
         try:
             from src.services.backtest_service import BacktestService
             service = BacktestService()
-            summary = service.get_strategy_summary(strategy_id)
+            summary = service.get_skill_summary(skill_id)
             if summary:
                 return {
                     "available": True,
@@ -226,29 +299,33 @@ class AgentMemory:
         except Exception:
             return {"available": False}
 
+    def get_strategy_performance(self, strategy_id: str) -> Dict[str, Any]:
+        """Compatibility wrapper for legacy strategy-based callers."""
+        return self.get_skill_performance(strategy_id)
+
     # -----------------------------------------------------------------
     # Auto-weighting
     # -----------------------------------------------------------------
 
-    def compute_strategy_weights(
+    def compute_skill_weights(
         self,
-        strategy_ids: List[str],
+        skill_ids: List[str],
         use_backtest: bool = True,
     ) -> Dict[str, float]:
-        """Compute normalized weights for a set of strategies.
+        """Compute normalized weights for a set of skills.
 
-        Strategies with higher historical performance get higher weights.
-        Strategies with insufficient samples get neutral weight (1.0).
+        Skills with higher historical performance get higher weights.
+        Skills with insufficient samples get neutral weight (1.0).
 
         Returns:
-            Dict mapping strategy_id → weight (normalized so mean ≈ 1.0)
+            Dict mapping skill_id → weight (normalized so mean ≈ 1.0)
         """
         if not self.enabled or not use_backtest:
-            return {sid: 1.0 for sid in strategy_ids}
+            return {sid: 1.0 for sid in skill_ids}
 
         raw_weights: Dict[str, float] = {}
-        for sid in strategy_ids:
-            perf = self.get_strategy_performance(sid)
+        for sid in skill_ids:
+            perf = self.get_skill_performance(sid)
             if perf.get("sufficient_samples"):
                 # Weight = 0.5 + win_rate (range: 0.5 to 1.5)
                 raw_weights[sid] = 0.5 + perf.get("win_rate", 0.5)
@@ -261,7 +338,15 @@ class AgentMemory:
             if mean_w > 0:
                 return {sid: w / mean_w for sid, w in raw_weights.items()}
 
-        return {sid: 1.0 for sid in strategy_ids}
+        return {sid: 1.0 for sid in skill_ids}
+
+    def compute_strategy_weights(
+        self,
+        strategy_ids: List[str],
+        use_backtest: bool = True,
+    ) -> Dict[str, float]:
+        """Compatibility wrapper for legacy strategy-based callers."""
+        return self.compute_skill_weights(strategy_ids, use_backtest=use_backtest)
 
     # -----------------------------------------------------------------
     # Internal
@@ -271,15 +356,15 @@ class AgentMemory:
         self,
         agent_name: str,
         stock_code: Optional[str],
-        strategy_id: Optional[str],
+        skill_id: Optional[str],
     ) -> Dict[str, Any]:
         """Aggregate accuracy statistics from backtest history."""
         try:
             from src.services.backtest_service import BacktestService
             service = BacktestService()
 
-            if strategy_id:
-                summary = service.get_strategy_summary(strategy_id)
+            if skill_id:
+                summary = service.get_skill_summary(skill_id)
             elif stock_code:
                 summary = service.get_stock_summary(stock_code)
             else:
